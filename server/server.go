@@ -5,29 +5,38 @@ import (
 
 	"google.golang.org/grpc"
 	api "modulo.com/proyecto_distribuido/api/v1"
+	auth "modulo.com/proyecto_distribuido/auth"
 	"modulo.com/proyecto_distribuido/log"
 )
 
 var _ api.LogServer = (*grpcServer)(nil)
 
 type Config struct {
-	CommitLog *log.Log
+	CommitLog  *log.Log
+	Authorizer *auth.Authorizer
 }
 
 type grpcServer struct {
-	api.UnimplementedLogServer
+	*api.UnimplementedLogServer
 	CommitLog *log.Log
 }
 
-func NewGRPCServer(config *Config) (srv *grpc.Server, err error) {
-
-	srv = grpc.NewServer()
-	grpcServer := &grpcServer{
-		CommitLog: config.CommitLog,
+func newgrpcServer(config *Config) (*grpcServer, error) {
+	srv := &grpcServer{
+		UnimplementedLogServer: &api.UnimplementedLogServer{},
+		CommitLog:              config.CommitLog,
 	}
-	api.RegisterLogServer(srv, grpcServer)
-
 	return srv, nil
+}
+
+func NewGRPCServer(config *Config, opts ...grpc.ServerOption) (*grpc.Server, error) {
+	gsrv := grpc.NewServer(opts...)
+	srv, err := newgrpcServer(config)
+	if err != nil {
+		return nil, err
+	}
+	api.RegisterLogServer(gsrv, srv)
+	return gsrv, nil
 }
 
 func (s *grpcServer) Produce(ctx context.Context, req *api.ProduceRequest) (*api.ProduceResponse, error) {
