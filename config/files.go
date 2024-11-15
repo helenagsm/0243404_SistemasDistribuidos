@@ -27,5 +27,5 @@ func configFile(filename string) string {
 	}
 
 	// modify this
-	return filepath.Join(homeDir, "/Downloads/proyecto_distribuido/", filename)
+	return filepath.Join(homeDir, "/Downloads/proyecto_distribuido/test/", filename)
 }
