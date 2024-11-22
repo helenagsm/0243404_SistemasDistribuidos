@@ -21,11 +21,7 @@ func configFile(filename string) string {
 	if dir := os.Getenv("CONFIG_DIR"); dir != "" {
 		return filepath.Join(dir, filename)
 	}
-	homeDir, err := os.UserHomeDir()
-	if err != nil {
-		panic(err)
-	}
 
 	// modify this
-	return filepath.Join(homeDir, "/Downloads/proyecto_distribuido/test/", filename)
+	return filepath.Join("/app/test/", filename)
 }
