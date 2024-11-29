@@ -2,11 +2,14 @@ package server
 
 import (
 	"context"
+	"flag"
 	"net"
 	"os"
 	"testing"
+	"time"
 
 	"github.com/stretchr/testify/require"
+	"go.opencensus.io/examples/exporter"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
 	"google.golang.org/grpc/credentials"
@@ -15,30 +18,27 @@ import (
 	auth "modulo.com/proyecto_distribuido/auth"
 	tlsconfig "modulo.com/proyecto_distribuido/config"
 	log "modulo.com/proyecto_distribuido/log"
+
 	// Cambien esto por la ruta en su máquina
+
+	"go.uber.org/zap"
 )
 
-func TestServer(t *testing.T) {
-	for scenario, fn := range map[string]func(
-		t *testing.T,
-		rootClient api.LogClient,
-		nobodyClient api.LogClient,
-		config *Config,
-	){
-		"produce/consume a message to/from the log succeeeds": testProduceConsume,
-		"produce/consume stream succeeds":                     testProduceConsumeStream,
-		"consume past log boundary fails":                     testConsumePastBoundary,
-		"test all endpoints from an unauthorized user":        testUnauthorized,
-	} {
-		t.Run(scenario, func(t *testing.T) {
-			rootClient, nobodyClient, config, teardown := setupTest(t, nil)
-			defer teardown()
-			fn(t, rootClient, nobodyClient, config)
-		})
+var debug = flag.Bool("debug", false, "Enable observability for debugging.")
+
+func TestMain(m *testing.M) {
+	flag.Parse()
+	if *debug {
+		logger, err := zap.NewDevelopment()
+		if err != nil {
+			panic(err)
+		}
+		zap.ReplaceGlobals(logger)
 	}
+	os.Exit(m.Run())
 }
 
-// END: intro
+/// TestSetup....
 
 // START: setup
 func setupTest(t *testing.T, fn func(*Config)) (
@@ -101,7 +101,25 @@ func setupTest(t *testing.T, fn func(*Config)) (
 	require.NoError(t, err)
 
 	authorizer := auth.New(tlsconfig.ACLModelFile, tlsconfig.ACLPolicyFile)
+	var telemetryExporter *exporter.LogExporter
+	if *debug {
+		metricsLogFile, err := os.CreateTemp("", "metrics-*.log")
+		require.NoError(t, err)
+		t.Logf("Metrics log file: %s", metricsLogFile.Name())
 
+		tracesLogFile, err := os.CreateTemp("", "traces-*.log")
+		require.NoError(t, err)
+		t.Logf("traces log file: %s", tracesLogFile.Name())
+
+		telemetryExporter, err = exporter.NewLogExporter(exporter.Options{
+			MetricsLogFile:    metricsLogFile.Name(),
+			TracesLogFile:     tracesLogFile.Name(),
+			ReportingInterval: time.Second,
+		})
+		require.NoError(t, err)
+		err = telemetryExporter.Start()
+		require.NoError(t, err)
+	}
 	config = &Config{
 		CommitLog:  clog,
 		Authorizer: authorizer,
@@ -121,12 +139,67 @@ func setupTest(t *testing.T, fn func(*Config)) (
 		rootConn.Close()
 		nobodyConn.Close()
 		l.Close()
+		if telemetryExporter != nil {
+			time.Sleep(1500 * time.Millisecond)
+			telemetryExporter.Stop()
+			telemetryExporter.Close()
+		}
 	}
 }
 
-// END: setup
+func TestServer(t *testing.T) {
+	for scenario, fn := range map[string]func(
+		t *testing.T,
+		rootClient api.LogClient,
+		nobodyClient api.LogClient,
+		config *Config,
+	){
+		"produce/consume a message to/from the log succeeeds": testProduceConsume,
+		"produce/consume stream succeeds":                     testProduceConsumeStream,
+		"consume past log boundary fails":                     testConsumePastBoundary,
+		"test all endpoints from an unauthorized user":        testUnauthorized,
+	} {
+		t.Run(scenario, func(t *testing.T) {
+			rootClient, nobodyClient, config, teardown := setupTest(t, nil)
+			defer teardown()
+			fn(t, rootClient, nobodyClient, config)
+		})
+	}
+}
 
-// START: produceconsume
+// END: intro
+
+// START: setup
+
+func testUnauthorized(
+	t *testing.T, _, client api.LogClient, config *Config,
+) {
+	ctx := context.Background()
+	produce, err := client.Produce(ctx, &api.ProduceRequest{
+		Record: &api.Record{
+			Value: []byte("hello world"),
+		},
+	},
+	)
+	if produce != nil {
+		t.Fatalf("Produce should be nil")
+	}
+	gotCode, wantCode := status.Code(err), codes.PermissionDenied
+	if gotCode != wantCode {
+		t.Fatalf("got code: %d, want: %d", gotCode, wantCode)
+	}
+	consume, err := client.Consume(ctx, &api.ConsumeRequest{
+		Offset: 0,
+	})
+	if consume != nil {
+		t.Fatalf("Consume should be nil")
+	}
+	gotCode, wantCode = status.Code(err), codes.PermissionDenied
+	if gotCode != wantCode {
+		t.Fatalf("got code: %d, want: %d", gotCode, wantCode)
+	}
+}
+
 func testProduceConsume(t *testing.T, client, _ api.LogClient, config *Config) {
 	ctx := context.Background()
 
@@ -150,37 +223,6 @@ func testProduceConsume(t *testing.T, client, _ api.LogClient, config *Config) {
 	require.Equal(t, want.Offset, consume.Record.Offset)
 }
 
-// END: produceconsume
-
-// START: consumeerror
-func testConsumePastBoundary(
-	t *testing.T, client, _ api.LogClient, config *Config,
-) {
-	ctx := context.Background()
-
-	produce, err := client.Produce(ctx, &api.ProduceRequest{
-		Record: &api.Record{
-			Value: []byte("hello world"),
-		},
-	})
-	require.NoError(t, err)
-
-	consume, err := client.Consume(ctx, &api.ConsumeRequest{
-		Offset: produce.Offset + 1,
-	})
-	if consume != nil {
-		t.Fatal("consume not nil")
-	}
-	got := status.Code(err)
-	want := status.Code(api.ErrOffsetOutOfRange{}.GRPCStatus().Err())
-	if got != want {
-		t.Fatalf("got err: %v, want: %v", got, want)
-	}
-}
-
-// END: consumeerror
-
-// START: stream
 func testProduceConsumeStream(
 	t *testing.T, client, _ api.LogClient, config *Config,
 ) {
@@ -234,31 +276,27 @@ func testProduceConsumeStream(
 	}
 }
 
-func testUnauthorized(
-	t *testing.T, _, client api.LogClient, config *Config,
+func testConsumePastBoundary(
+	t *testing.T, client, _ api.LogClient, config *Config,
 ) {
 	ctx := context.Background()
+
 	produce, err := client.Produce(ctx, &api.ProduceRequest{
 		Record: &api.Record{
 			Value: []byte("hello world"),
 		},
-	},
-	)
-	if produce != nil {
-		t.Fatalf("Produce should be nil")
-	}
-	gotCode, wantCode := status.Code(err), codes.PermissionDenied
-	if gotCode != wantCode {
-		t.Fatalf("got code: %d, want: %d", gotCode, wantCode)
-	}
+	})
+	require.NoError(t, err)
+
 	consume, err := client.Consume(ctx, &api.ConsumeRequest{
-		Offset: 0,
+		Offset: produce.Offset + 1,
 	})
 	if consume != nil {
-		t.Fatalf("Consume should be nil")
+		t.Fatal("consume not nil")
 	}
-	gotCode, wantCode = status.Code(err), codes.PermissionDenied
-	if gotCode != wantCode {
-		t.Fatalf("got code: %d, want: %d", gotCode, wantCode)
+	got := status.Code(err)
+	want := status.Code(api.ErrOffsetOutOfRange{}.GRPCStatus().Err())
+	if got != want {
+		t.Fatalf("got err: %v, want: %v", got, want)
 	}
 }
