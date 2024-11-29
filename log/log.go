@@ -9,8 +9,19 @@ import (
 	"strings"
 	"sync"
 
+	"google.golang.org/grpc"
 	api "modulo.com/proyecto_distribuido/api/v1"
 )
+
+type Replicator struct {
+	DialOptions []grpc.DialOption
+	LocalServer api.LogClient
+}
+
+type Handler interface {
+	Join(name, addr string) error
+	Leave(name string) error
+}
 
 type Log struct {
 	mu sync.RWMutex
@@ -213,4 +224,14 @@ func (o *originReader) Read(p []byte) (int, error) {
 	n, err := o.ReadAt(p, o.off)
 	o.off += int64(n)
 	return n, err
+}
+
+func (r *Replicator) Close() error {
+	// Lógica para cerrar la conexión gRPC, si es necesario.
+	return nil
+}
+
+func (r *Replicator) Join(name, addr string) error {
+
+	return nil
 }

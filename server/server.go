@@ -33,16 +33,22 @@ type Config struct {
 	Authorizer *auth.Authorizer
 }
 
+const (
+	objectWildcard = "*"
+	produceAction  = "produce"
+	consumeAction  = "consume"
+)
+
 // grpcServer implementa la interfaz LogServer de gRPC.
 type grpcServer struct {
 	*api.UnimplementedLogServer
-	CommitLog *log.Log
+	*Config
 }
 
 func newgrpcServer(config *Config) (*grpcServer, error) {
 	srv := &grpcServer{
 		UnimplementedLogServer: &api.UnimplementedLogServer{},
-		CommitLog:              config.CommitLog,
+		Config:                 config,
 	}
 	return srv, nil
 }
@@ -88,6 +94,86 @@ func NewGRPCServer(config *Config, opts ...grpc.ServerOption) (*grpc.Server, err
 	api.RegisterLogServer(gsrv, srv)
 	return gsrv, nil
 }
+
+type subjectContextKey struct{}
+
+// Produce permite agregar un registro al log.
+func (s *grpcServer) Produce(ctx context.Context, req *api.ProduceRequest) (
+	*api.ProduceResponse, error) {
+	if err := s.Authorizer.Authorize(
+		subject(ctx),
+		objectWildcard,
+		produceAction,
+	); err != nil {
+		return nil, err
+	}
+	offset, err := s.CommitLog.Append(req.Record)
+	if err != nil {
+		return nil, err
+	}
+	return &api.ProduceResponse{Offset: offset}, nil
+}
+
+// Consume permite leer un registro del log.
+func (s *grpcServer) Consume(ctx context.Context, req *api.ConsumeRequest) (
+	*api.ConsumeResponse, error) {
+	if err := s.Authorizer.Authorize(
+		subject(ctx),
+		objectWildcard,
+		consumeAction,
+	); err != nil {
+		return nil, err
+	}
+	record, err := s.CommitLog.Read(req.Offset)
+	if err != nil {
+		return nil, api.ErrOffsetOutOfRange{Offset: req.Offset}
+	}
+	return &api.ConsumeResponse{Record: record}, nil
+}
+
+// ProduceStream maneja un stream de solicitudes Produce.
+func (s *grpcServer) ProduceStream(stream api.Log_ProduceStreamServer) error {
+	for {
+		req, err := stream.Recv()
+		if err != nil {
+			return err
+		}
+		res, err := s.Produce(stream.Context(), req)
+		if err != nil {
+			return err
+		}
+		if err = stream.Send(res); err != nil {
+			return err
+		}
+	}
+}
+
+// ConsumeStream maneja un stream de solicitudes Consume.
+func (s *grpcServer) ConsumeStream(
+	req *api.ConsumeRequest,
+	stream api.Log_ConsumeStreamServer,
+) error {
+	for {
+		select {
+		case <-stream.Context().Done():
+			return nil
+		default:
+			res, err := s.Consume(stream.Context(), req)
+			switch err.(type) {
+			case nil:
+			case api.ErrOffsetOutOfRange:
+				continue
+			default:
+				return err
+			}
+			if err = stream.Send(res); err != nil {
+				return err
+			}
+			req.Offset++
+		}
+	}
+}
+
 func authenticate(ctx context.Context) (context.Context, error) {
 	p, ok := peer.FromContext(ctx)
 	if !ok {
@@ -110,86 +196,7 @@ func authenticate(ctx context.Context) (context.Context, error) {
 
 	return ctx, nil
 }
+
 func subject(ctx context.Context) string {
 	return ctx.Value(subjectContextKey{}).(string)
-}
-
-type subjectContextKey struct{}
-
-// Produce permite agregar un registro al log.
-func (s *grpcServer) Produce(ctx context.Context, req *api.ProduceRequest) (*api.ProduceResponse, error) {
-	if req == nil || req.Record == nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid request")
-	}
-
-	offset, err := s.CommitLog.Append(req.Record)
-	if err != nil {
-		return nil, err
-	}
-	return &api.ProduceResponse{Offset: offset}, nil
-}
-
-// Consume permite leer un registro del log.
-func (s *grpcServer) Consume(ctx context.Context, req *api.ConsumeRequest) (*api.ConsumeResponse, error) {
-	if req == nil {
-		return nil, status.Errorf(codes.InvalidArgument, "invalid request")
-	}
-
-	record, err := s.CommitLog.Read(req.Offset)
-	if err != nil {
-		return nil, err
-	}
-	return &api.ConsumeResponse{Record: record}, nil
-}
-
-// ProduceStream maneja un stream de solicitudes Produce.
-func (s *grpcServer) ProduceStream(stream api.Log_ProduceStreamServer) error {
-	for {
-		select {
-		case <-stream.Context().Done():
-			return stream.Context().Err()
-		default:
-			req, err := stream.Recv()
-			if err != nil {
-				return err
-			}
-
-			res, err := s.Produce(stream.Context(), req)
-			if err != nil {
-				return err
-			}
-
-			if err := stream.Send(res); err != nil {
-				return err
-			}
-		}
-	}
-}
-
-// ConsumeStream maneja un stream de solicitudes Consume.
-func (s *grpcServer) ConsumeStream(req *api.ConsumeRequest, stream api.Log_ConsumeStreamServer) error {
-	if req == nil {
-		return status.Errorf(codes.InvalidArgument, "invalid request")
-	}
-
-	for {
-		select {
-		case <-stream.Context().Done():
-			return stream.Context().Err()
-		default:
-			res, err := s.Consume(stream.Context(), req)
-			switch err.(type) {
-			case nil:
-			case api.ErrOffsetOutOfRange:
-				continue
-			default:
-				return err
-			}
-
-			if err := stream.Send(res); err != nil {
-				return err
-			}
-			req.Offset++
-		}
-	}
 }
